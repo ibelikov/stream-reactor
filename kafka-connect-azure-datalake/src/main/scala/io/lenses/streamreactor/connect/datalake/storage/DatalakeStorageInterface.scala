@@ -174,6 +174,13 @@ class DatalakeStorageInterface(connectorTaskId: ConnectorTaskId, client: DataLak
     logger.debug(s"[{}] Uploading file from local {} to Data Lake {}:{}", connectorTaskId.show, source, bucket, path)
     for {
       file <- source.validate.toEither
+      // Ensure parent directory exists for ADLS Gen2 before creating the file
+      _ <- {
+        val idx = path.lastIndexOf('/')
+        if (idx > 0)
+          createDirectoryIfNotExists(bucket, path.substring(0, idx)).leftMap(identity)
+        else ().asRight[UploadError]
+      }
       eTag <- Try {
         val createFileClient: DataLakeFileClient = createFile(bucket, path)
         val response = createFileClient.uploadFromFileWithResponse(
@@ -260,22 +267,54 @@ class DatalakeStorageInterface(connectorTaskId: ConnectorTaskId, client: DataLak
     maybeEtag: Option[String],
   ): Either[FileMoveError, Unit] = {
     val conditions = maybeEtag.map(new DataLakeRequestConditions().setIfMatch(_))
-    Try(
-      client.getFileSystemClient(oldBucket).getFileClient(oldPath)
-        .renameWithResponse(
-          newBucket,
-          newPath,
-          conditions.orNull,
-          null,
-          null,
-          Context.NONE,
-        ),
-    ).toEither.leftMap(
-      FileMoveError(_, oldPath, newPath),
-    ).void
+    // Ensure the destination parent directory exists prior to rename (required by ADLS Gen2 with Hierarchical namespace)
+    val maybeParentDir: Option[String] = Option(newPath).flatMap { p =>
+      val idx = p.lastIndexOf('/')
+      if (idx > 0) Some(p.substring(0, idx)) else None
+    }
+
+    val ensureParentDir: Either[FileMoveError, Unit] = maybeParentDir
+      .map { parentDir =>
+        createDirectoryIfNotExists(newBucket, parentDir).leftMap(err => FileMoveError(err.exception, oldPath, newPath))
+      }
+      .getOrElse(Right(()))
+
+    ensureParentDir.flatMap { _ =>
+      Try(
+        client.getFileSystemClient(oldBucket).getFileClient(oldPath)
+          .renameWithResponse(
+            newBucket,
+            newPath,
+            conditions.orNull,
+            null,
+            null,
+            Context.NONE,
+          ),
+      ).toEither.leftMap(
+        FileMoveError(_, oldPath, newPath),
+      ).void
+    }
   }
 
-  override def createDirectoryIfNotExists(bucket: String, path: String): Either[FileCreateError, Unit] = ().asRight
+  override def createDirectoryIfNotExists(bucket: String, path: String): Either[FileCreateError, Unit] = {
+    // Create the directory path recursively
+    val normalizedPath = Option(path).map(_.trim.stripPrefix("/").stripSuffix("/")).getOrElse("")
+    if (normalizedPath.isEmpty) {
+      ().asRight
+    } else {
+      Try {
+        val fsClient = client.getFileSystemClient(bucket)
+        val segments = normalizedPath.split('/').toList.filter(_.nonEmpty)
+        var current  = ""
+        segments.foreach { segment =>
+          current = if (current.isEmpty) segment else s"$current/$segment"
+          val dirClient = fsClient.getDirectoryClient(current)
+          dirClient.createIfNotExists()
+          ()
+        }
+      }.toEither.leftMap(e => FileCreateError(e, normalizedPath)).void
+    }
+  }
 
   override def getBlobAsStringAndEtag(bucket: String, path: String): Either[FileLoadError, (String, String)] =
     Try {
@@ -334,6 +373,13 @@ class DatalakeStorageInterface(connectorTaskId: ConnectorTaskId, client: DataLak
     }
 
     for {
+      // Ensure parent directory exists for ADLS Gen2 before creating the file
+      _ <- {
+        val idx = path.lastIndexOf('/')
+        if (idx > 0)
+          createDirectoryIfNotExists(bucket, path.substring(0, idx)).leftMap(identity)
+        else ().asRight[UploadError]
+      }
       resp <- Try {
         val createFileClient: DataLakeFileClient = createFile(bucket, path)
         val bytes = content.getBytes
