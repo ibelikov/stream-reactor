@@ -16,6 +16,7 @@
 package io.lenses.streamreactor.connect.datalake.storage
 import cats.implicits._
 import com.azure.core.http.rest.PagedIterable
+import com.azure.core.util.BinaryData
 import com.azure.core.util.Context
 import com.azure.storage.common.ParallelTransferOptions
 import com.azure.storage.file.datalake.DataLakeFileClient
@@ -24,9 +25,9 @@ import com.azure.storage.file.datalake.models.DataLakeRequestConditions
 import com.azure.storage.file.datalake.models.DataLakeStorageException
 import com.azure.storage.file.datalake.models.FileReadResponse
 import com.azure.storage.file.datalake.models.ListPathsOptions
-import com.azure.storage.file.datalake.models.PathHttpHeaders
 import com.azure.storage.file.datalake.models.PathItem
 import com.azure.storage.file.datalake.options.DataLakePathDeleteOptions
+import com.azure.storage.file.datalake.options.FileParallelUploadOptions
 import com.typesafe.scalalogging.LazyLogging
 import io.circe.Encoder
 import io.circe.syntax.EncoderOps
@@ -34,7 +35,6 @@ import io.lenses.streamreactor.connect.cloud.common.config.ConnectorTaskId
 import io.lenses.streamreactor.connect.cloud.common.config.ObjectMetadata
 import io.lenses.streamreactor.connect.cloud.common.model.UploadableFile
 import io.lenses.streamreactor.connect.cloud.common.model.UploadableString
-import io.lenses.streamreactor.connect.cloud.common.sink.seek.NoOverwriteExistingObject
 import io.lenses.streamreactor.connect.cloud.common.sink.seek.ObjectProtection
 import io.lenses.streamreactor.connect.cloud.common.sink.seek.ObjectWithETag
 import io.lenses.streamreactor.connect.cloud.common.storage._
@@ -174,9 +174,6 @@ class DatalakeStorageInterface(connectorTaskId: ConnectorTaskId, client: DataLak
 
   private def createFile(bucket: String, path: String): DataLakeFileClient =
     client.getFileSystemClient(bucket).createFile(path, true)
-
-  private def createFileIfNotExists(bucket: String, path: String): DataLakeFileClient =
-    client.getFileSystemClient(bucket).createFileIfNotExists(path)
 
   override def uploadFile(source: UploadableFile, bucket: String, path: String): Either[UploadError, String] = {
     logger.debug(s"[{}] Uploading file from local {} to Data Lake {}:{}", connectorTaskId.show, source, bucket, path)
@@ -346,7 +343,7 @@ class DatalakeStorageInterface(connectorTaskId: ConnectorTaskId, client: DataLak
             null,
             Context.NONE,
           )
-          (resp.getDeserializedHeaders.getETag, new String(baos.toByteArray))
+          (new String(baos.toByteArray), resp.getDeserializedHeaders.getETag)
       }
     }.toEither.leftMap {
       case ex: DataLakeStorageException if ex.getStatusCode == 404 =>
@@ -381,56 +378,46 @@ class DatalakeStorageInterface(connectorTaskId: ConnectorTaskId, client: DataLak
       s"[${connectorTaskId.show}] Uploading file from json object ({${objectProtection.wrappedObject}}) to datalake $bucket:$path",
     )
 
-    val content           = objectProtection.wrappedObject.asJson.noSpaces
-    val requestConditions = new DataLakeRequestConditions()
-    val protection: DataLakeRequestConditions = objectProtection match {
-      case NoOverwriteExistingObject(_) => requestConditions
-      case ObjectWithETag(_, eTag)      => requestConditions.setIfMatch(eTag)
-      case _                            => requestConditions
-    }
+    val content = objectProtection.wrappedObject.asJson.noSpaces
 
     def tryWriteBlob(): Either[Throwable, String] = Try {
-      val createFileClient: DataLakeFileClient = createFileIfNotExists(bucket, path)
-      val bytes = content.getBytes
-      Using.resource(new ByteArrayInputStream(bytes)) { bais =>
-        createFileClient.append(bais, 0, bytes.length.toLong)
+      val fsClient   = client.getFileSystemClient(bucket)
+      val fileClient = fsClient.getFileClient(path)
+
+      // Build request conditions based on protection type
+      val requestConditions = objectProtection match {
+        case ObjectWithETag(_, eTag) => new DataLakeRequestConditions().setIfMatch(eTag)
+        case _                       => null
       }
-      val position              = bytes.length.toLong
-      val pathHttpHeaders       = new PathHttpHeaders()
-      val retainUncommittedData = true
-      val close                 = false // or true, if you want to finalize the file
-      val context               = Context.NONE
-      val response = createFileClient.flushWithResponse(
-        position,
-        retainUncommittedData,
-        close,
-        pathHttpHeaders,
-        protection,
-        null,
-        context,
-      )
+
+      val options = new FileParallelUploadOptions(BinaryData.fromString(content))
+      if (requestConditions != null) {
+        options.setRequestConditions(requestConditions)
+      }
+      val response = fileClient.uploadWithResponse(options, null, Context.NONE)
       response.getValue.getETag
     }.toEither
 
-    tryWriteBlob() match {
-      case Right(eTag) =>
-        logger.debug(
-          s"[${connectorTaskId.show}] Completed upload from data string ($content) to datalake $bucket:$path",
-        )
-        Right(new ObjectWithETag[O](objectProtection.wrappedObject, eTag))
-      case Left(dse: DataLakeStorageException)
-          if dse.getStatusCode == 404 || Option(dse.getMessage).exists(_.contains("PathNotFound")) =>
-        parentDirectory(path) match {
-          case Some(dir) =>
-            createDirectoryIfNotExists(bucket, dir) match {
-              case Left(err) => Left(FileCreateError(err.exception, content))
-              case Right(_) => tryWriteBlob().leftMap(ex => FileCreateError(ex, content)).map(et =>
-                  new ObjectWithETag[O](objectProtection.wrappedObject, et),
-                )
-            }
-          case None => Left(FileCreateError(dse, content))
-        }
-      case Left(other) => Left(FileCreateError(other, content))
-    }
+    for {
+      _ <- parentDirectory(path).map(dir => createDirectoryIfNotExists(bucket, dir)).getOrElse(Right(()))
+      eTag <- tryWriteBlob() match {
+        case Right(tag) =>
+          logger.debug(
+            s"[${connectorTaskId.show}] Completed upload from data string ($content) to datalake $bucket:$path",
+          )
+          Right(tag)
+        case Left(dse: DataLakeStorageException)
+            if dse.getStatusCode == 404 || Option(dse.getMessage).exists(_.contains("PathNotFound")) =>
+          parentDirectory(path) match {
+            case Some(dir) =>
+              createDirectoryIfNotExists(bucket, dir) match {
+                case Left(err) => Left(FileCreateError(err.exception, content))
+                case Right(_)  => tryWriteBlob().leftMap(ex => FileCreateError(ex, content))
+              }
+            case None => Left(FileCreateError(dse, content))
+          }
+        case Left(other) => Left(FileCreateError(other, content))
+      }
+    } yield new ObjectWithETag[O](objectProtection.wrappedObject, eTag)
   }
 }

@@ -681,23 +681,25 @@ class DatalakeStorageInterfaceTest
   }
 
   "writeBlobToFile" should "write the data to the specified path when successful" in {
-    val idx = IndexFile("test-owner", Option.empty, Option.empty) // equivalent to "{\"owner\":\"test-owner\",\"committedOffset\":null,\"pendingState\":null}"
+    val idx = IndexFile("test-owner", Option.empty, Option.empty)
 
     val bucket = "test-bucket"
     val path   = "test-path"
     val objectProtection = NoOverwriteExistingObject(idx)
+    val expectedETag     = "test-etag"
 
-    var readFromIS: Option[String] = Option.empty
-    when(
-      client.getFileSystemClient(bucket).createFileIfNotExists(path).append(any[ByteArrayInputStream], anyLong, anyLong),
-    ).thenAnswer {
-      (inputStream: ByteArrayInputStream, _: Long, _: Long) =>
-        readFromIS = new String(inputStream.readAllBytes()).some
-        ()
-    }
+    val mockFileClient = mock[DataLakeFileClient]
+    val mockPathInfo   = mock[PathInfo]
+    when(mockPathInfo.getETag).thenReturn(expectedETag)
 
-    storageInterface.writeBlobToFile(bucket, path, objectProtection) should be(Right(new ObjectWithETag(objectProtection.wrappedObject, null)))
-    readFromIS.value should be("{\"owner\":\"test-owner\",\"committedOffset\":null,\"pendingState\":null}")
+    val mockResponse = mock[Response[PathInfo]]
+    when(mockResponse.getValue).thenReturn(mockPathInfo)
+
+    when(client.getFileSystemClient(bucket).getFileClient(path)).thenReturn(mockFileClient)
+    when(mockFileClient.uploadWithResponse(any, any, any)).thenReturn(mockResponse)
+
+    val result = storageInterface.writeBlobToFile(bucket, path, objectProtection)
+    result should be(Right(new ObjectWithETag(objectProtection.wrappedObject, expectedETag)))
   }
 
 }
